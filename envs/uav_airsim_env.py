@@ -44,7 +44,7 @@ class UAVSimpleTrainEnv(gym.Env):
 		)
 
 		depth_dim = self.depth_feature_size[0] * self.depth_feature_size[1]
-		obs_dim = depth_dim + 3 + 3
+		obs_dim = depth_dim + 3 + 3 + 3 # 增加3维用于 prev_action
 		self.observation_space = spaces.Box(
 			low=-1_000.0,
 			high=1_000.0,
@@ -58,6 +58,7 @@ class UAVSimpleTrainEnv(gym.Env):
 		self.target_pos = np.zeros(3, dtype=np.float32)
 		self.prev_distance = 0.0
 		self.current_step = 0
+		self.prev_action = np.zeros(3, dtype=np.float32)
 
 	def _connect_client(self) -> None:
 		"""建立连接并获取控制权。"""
@@ -124,11 +125,12 @@ class UAVSimpleTrainEnv(gym.Env):
 		1) 深度特征 144维
 		2) 当前速度 3维
 		3) 目标相对位移向量 3维
+		4) prev_action 3维
 		"""
 		current_pos, current_vel = self._get_kinematics()
 		target_delta = (self.target_pos - current_pos).astype(np.float32)
 		depth_feat = self._get_depth_feature()
-		obs = np.concatenate([depth_feat, current_vel, target_delta], axis=0).astype(
+		obs = np.concatenate([depth_feat, current_vel, target_delta, self.prev_action], axis=0).astype(
 			np.float32
 		)
 		return obs
@@ -148,6 +150,7 @@ class UAVSimpleTrainEnv(gym.Env):
 
 		self.prev_distance = self._compute_distance(current_pos, self.target_pos)
 		self.current_step = 0
+		self.prev_action = np.zeros(3, dtype=np.float32)
 
 		obs = self._get_obs()
 		info = {
@@ -161,9 +164,13 @@ class UAVSimpleTrainEnv(gym.Env):
 
 		action = np.asarray(action, dtype=np.float32).reshape(self.action_space.shape)
 		action = np.clip(action, self.action_space.low, self.action_space.high)
+		alpha = 0.6
+		# 指数移动平均平滑动作，防止速度突变导致机身剧烈摇晃抖动（EMA）
+		action_smoothed = alpha * self.prev_action + (1-alpha) * action
+		self.prev_action = action_smoothed.copy()
 
 		# TD3 输出为 [-1,1]，缩放后映射到最大速度指令。
-		vx, vy, vz = (action * self.max_speed).tolist()
+		vx, vy, vz = (action_smoothed * self.max_speed).tolist()
 		self.client.moveByVelocityAsync(
 			float(vx), float(vy), float(vz), duration=self.step_duration*1.25
 		)
