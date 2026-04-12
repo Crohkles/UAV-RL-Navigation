@@ -7,10 +7,84 @@ import numpy as np
 from stable_baselines3 import TD3
 from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.noise import NormalActionNoise
-from stable_baselines3.common.vec_env import SubprocVecEnv
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
+from stable_baselines3.common.callbacks import BaseCallback
+from rich.live import Live
+from rich.table import Table
 
 from envs.uav_multi_env import UAVMultiTrainEnv
 
+class RollingCheckpointCallback(CheckpointCallback):
+    """仅保留最近 N 个 checkpoint，自动删除更早的。"""
+
+    def __init__(self, keep_last_n: int = 3, **kwargs):
+        super().__init__(**kwargs)
+        self.keep_last_n = keep_last_n
+
+    def _on_step(self) -> bool:
+        result = super()._on_step()
+        self._cleanup()
+        return result
+
+    def _cleanup(self) -> None:
+        checkpoints: list[tuple[int, str]] = []
+        for fname in os.listdir(self.save_path):
+            match = re.match(rf"^{re.escape(self.name_prefix)}_(\d+)_steps\.zip$", fname)
+            if match:
+                checkpoints.append((int(match.group(1)), fname))
+
+        if len(checkpoints) <= self.keep_last_n:
+            return
+
+        checkpoints.sort(key=lambda x: x[0])
+        for _, fname in checkpoints[: -self.keep_last_n]:
+            base = os.path.join(self.save_path, fname.removesuffix(".zip"))
+            for suffix in (".zip", "_replay_buffer.pkl", "_vecnormalize.pkl"):
+                path = base + suffix
+                if os.path.exists(path):
+                    os.remove(path)
+            print(f"  已清理旧 checkpoint: {base}.*")
+
+
+class DroneMonitorCallback(BaseCallback):
+    def __init__(self, num_envs: int, verbose=0):
+        super().__init__(verbose)
+        self.num_envs = num_envs
+        self.live = None
+        self.latest_infos = [{} for _ in range(num_envs)]
+
+    def _on_training_start(self):
+        self.live = Live(refresh_per_second=10)
+        self.live.start()
+
+    def _on_step(self) -> bool:
+        infos = self.locals.get("infos", [])
+
+        for i in range(len(infos)):
+            self.latest_infos[i] = infos[i]
+
+        table = Table(title="UAV Training Monitor")
+        table.add_column("Drone")
+        table.add_column("Step")
+        table.add_column("Dist")
+        table.add_column("Reward")
+        table.add_column("Event")
+
+        for i, info in enumerate(self.latest_infos):
+            table.add_row(
+                f"Drone{i+1}",
+                str(info.get('episode_step', 0)),
+                f"{info.get('distance_to_target', 0):.2f}",
+                f"{info.get('reward', 0):.2f}",
+                str(info.get("event")),
+            )
+
+        self.live.update(table)
+        return True
+
+    def _on_training_end(self):
+        if self.live:
+            self.live.stop()
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="TD3 multi-drone parallel training")
@@ -79,6 +153,7 @@ def _make_env(vehicle_name: str, start_pos: np.ndarray, seed: int):
         env = UAVMultiTrainEnv(
             vehicle_name=vehicle_name,
             start_pos=start_pos,
+            alpha=0.5,
         )
         env.reset(seed=seed)
         return env
@@ -112,7 +187,15 @@ def main() -> None:
         for i in range(args.num_drones)
     ]
     vec_env = SubprocVecEnv(env_fns)
-    print(f"已创建 {args.num_drones} 个并行环境 (SubprocVecEnv)")
+    vec_env = VecNormalize(
+        vec_env,
+        norm_obs=True,
+        norm_reward=True,
+        clip_obs=10.0,
+        clip_reward=10.0,
+        gamma=0.99,
+    )
+    print(f"已创建 {args.num_drones} 个并行环境 (SubprocVecEnv + VecNormalize)")
 
     n_actions = vec_env.action_space.shape[-1]
     action_noise = NormalActionNoise(
@@ -127,6 +210,20 @@ def main() -> None:
         resume_zip = _resolve_model_zip_path(args.resume_model)
         if not os.path.exists(resume_zip):
             raise FileNotFoundError(f"Resume model not found: {resume_zip}")
+
+        # 恢复 VecNormalize 归一化统计量
+        vecnormalize_path = resume_zip.replace("_steps.zip", "_steps_vecnormalize.pkl")
+        if not os.path.exists(vecnormalize_path):
+            vecnormalize_path = os.path.join(
+                model_dir, f"{args.save_name}_vecnormalize.pkl"
+            )
+        if os.path.exists(vecnormalize_path):
+            vec_env = VecNormalize.load(vecnormalize_path, vec_env)
+            vec_env.training = True
+            vec_env.norm_reward = True
+            print(f"已加载 VecNormalize 统计量: {vecnormalize_path}")
+        else:
+            print("警告: 未找到 VecNormalize 统计量，将从头开始积累归一化参数")
 
         model = TD3.load(
             resume_zip,
@@ -170,18 +267,20 @@ def main() -> None:
     checkpoint_dir = os.path.join(checkpoint_root, run_name)
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    checkpoint_callback = CheckpointCallback(
+    checkpoint_callback = RollingCheckpointCallback(
+        keep_last_n=3,
         save_freq=args.checkpoint_freq,
         save_path=checkpoint_dir,
         name_prefix=f"{args.save_name}_ckpt",
         save_replay_buffer=True,
-        save_vecnormalize=False,
+        save_vecnormalize=True,
     )
 
+    monitor_callback = DroneMonitorCallback(args.num_drones)
     model.learn(
         total_timesteps=args.total_timesteps,
         progress_bar=True,
-        callback=checkpoint_callback,
+        callback=[checkpoint_callback, monitor_callback],
         reset_num_timesteps=not resume_mode,
     )
 
@@ -189,6 +288,7 @@ def main() -> None:
     latest_model_path = os.path.join(model_dir, args.save_name)
     model.save(archived_model_path)
     model.save(latest_model_path)
+    vec_env.save(os.path.join(model_dir, f"{args.save_name}_vecnormalize.pkl"))
     vec_env.close()
 
     print(f"训练完成，归档模型: {archived_model_path}.zip")

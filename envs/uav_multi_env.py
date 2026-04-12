@@ -28,6 +28,7 @@ class UAVMultiTrainEnv(gym.Env):
         success_threshold: float = 2.0,
         depth_feature_size: tuple[int, int] = (12, 12),
         max_depth_m: float = 50.0,
+        alpha: float = 0.2,
     ) -> None:
         super().__init__()
 
@@ -43,6 +44,7 @@ class UAVMultiTrainEnv(gym.Env):
         self.success_threshold = float(success_threshold)
         self.depth_feature_size = depth_feature_size
         self.max_depth_m = float(max_depth_m)
+        self.alpha = float(alpha)
 
         self.target_min = np.array([10.0, -15.0, -40.0], dtype=np.float32)
         self.target_max = np.array([30.0, 15.0, -20.0], dtype=np.float32)
@@ -69,6 +71,7 @@ class UAVMultiTrainEnv(gym.Env):
         self.target_pos = np.zeros(3, dtype=np.float32)
         self.prev_distance = 0.0
         self.current_step = 0
+        self.v_cmd_prev = np.zeros(3, dtype=np.float32)
 
     def _connect_client(self) -> None:
         """建立连接并获取指定无人机的控制权。"""
@@ -158,6 +161,8 @@ class UAVMultiTrainEnv(gym.Env):
 
         self.prev_distance = self._compute_distance(current_pos, self.target_pos)
         self.current_step = 0
+        self.v_cmd_prev = np.zeros(3, dtype=np.float32)
+        self.v_cmd_prev_last = np.zeros(3, dtype=np.float32)
 
         obs = self._get_obs()
         info = {
@@ -166,13 +171,40 @@ class UAVMultiTrainEnv(gym.Env):
         }
         return obs, info
 
+    def _log_event(self, event, reward, distance):
+        print(
+            f"[{self.vehicle_name}] step={self.current_step} "
+            f"event={event} reward={reward:.2f} dist={distance:.2f}"
+        )
+
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict]:
+        """执行一步环境交互。
+
+        流程：
+        1) 将策略输出动作限制到 [-1, 1]，并映射为速度指令；
+        2) 在 AirSim 中下发速度控制并等待一个 step_duration；
+        3) 读取碰撞/位置/速度，计算到目标点距离；
+        4) 根据碰撞、到达目标、距离变化计算奖励并判定终止；
+        5) 构造下一时刻观测与诊断信息并返回。
+        """
+        # 记录环境步数，用于最大步长截断逻辑。
         self.current_step += 1
 
-        action = np.asarray(action, dtype=np.float32).reshape(self.action_space.shape)
-        action = np.clip(action, self.action_space.low, self.action_space.high)
+        # 将输入动作标准化为期望形状 (3,)，并裁剪到动作空间范围 [-1, 1]。
+        # 这样可以容忍策略网络输出轻微越界，避免向模拟器发送异常指令。
+        action = np.asarray(action, dtype=np.float32).reshape(self.action_space.shape) # type: ignore
+        action = np.clip(action, self.action_space.low, self.action_space.high) # type: ignore
 
-        vx, vy, vz = (action * self.max_speed).tolist()
+        # 将归一化动作按最大速度线性放缩为 NED 坐标系速度命令。
+        # vx, vy, vz 分别对应前后、左右、上下方向速度（单位 m/s）。
+        v_target = action * self.max_speed
+        v_cmd = self.v_cmd_prev + self.alpha * (v_target - self.v_cmd_prev)
+        self.v_cmd_prev_last = self.v_cmd_prev.copy()
+        self.v_cmd_prev = v_cmd.copy()
+        vx, vy, vz = v_cmd.tolist()
+
+        # 异步下发速度控制。这里给出略大于 step_duration 的控制时长，
+        # 目的是让无人机在当前步内持续执行该动作，降低控制空窗影响。
         self.client.moveByVelocityAsync(
             float(vx),
             float(vy),
@@ -180,45 +212,66 @@ class UAVMultiTrainEnv(gym.Env):
             duration=self.step_duration * 1.25,
             vehicle_name=self.vehicle_name,
         )
+        # 训练环境采用“离散步推进”，通过 sleep 对齐一个 RL step 的物理时长。
         time.sleep(self.step_duration)
 
+        # 执行动作后立刻读取碰撞状态与运动学信息，作为本步转移结果。
         collision = self.client.simGetCollisionInfo(
             vehicle_name=self.vehicle_name
         ).has_collided
         current_pos, current_vel = self._get_kinematics()
         distance_to_target = self._compute_distance(current_pos, self.target_pos)
 
+        # Gymnasium 语义：
+        # terminated 表示任务自然结束（成功/失败）；
+        # truncated 表示因外部限制中断（如超步数）。
         terminated = False
         truncated = False
 
+        progress = self.prev_distance - distance_to_target
+
+        event = None
         if collision:
             reward = -100.0
             terminated = True
+            event = "collision"
         elif distance_to_target < self.success_threshold:
             reward = 100.0
             terminated = True
+            event = "success"
         else:
-            progress_reward = self.prev_distance - distance_to_target
-            if progress_reward >= 0:
-                progress_reward *= 2.0
+            # 非对称进度奖励：正向加倍鼓励接近，负向封顶鼓励探索
+            if progress >= 0:
+                r_progress = progress * 2.0
             else:
-                progress_reward = max(progress_reward, -0.5)
+                r_progress = max(progress, -0.5)
+            reward = float(r_progress + 0.03)
 
-            reward = float(progress_reward + 0.03)
-
+        # 超过最大步数时触发截断（前提是尚未自然终止）。
         if self.current_step >= self.max_episode_steps and not terminated:
             truncated = True
 
+        # 更新“上一时刻距离”，供下一步计算距离改变量。
         self.prev_distance = distance_to_target
+
+        # 组装下一观测。
         obs = self._get_obs()
+
+        # self._log_event(event, reward, distance_to_target)
+
+        # info 用于训练外的调试与可视化分析，不参与策略梯度计算。
         info = {
             "target_pos": self.target_pos.copy(),
             "position": current_pos,
             "velocity": current_vel,
             "distance_to_target": distance_to_target,
             "collision": bool(collision),
+            # raw_action 是裁剪后的归一化动作；scaled_velocity_cmd 为实际下发速度。
             "raw_action": action.copy(),
             "scaled_velocity_cmd": np.array([vx, vy, vz], dtype=np.float32),
+            "event": event,
+            "reward": float(reward),
+            "episode_step": self.current_step
         }
         return obs, float(reward), terminated, truncated, info
 
