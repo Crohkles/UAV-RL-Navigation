@@ -26,6 +26,12 @@ def _parse_args() -> argparse.Namespace:
         help="Save checkpoint every N timesteps.",
     )
     parser.add_argument(
+        "--buffer-size",
+        type=int,
+        default=50_000,
+        help="Replay buffer size. Lower this for high-dimensional observations.",
+    )
+    parser.add_argument(
         "--resume-model",
         type=str,
         default="",
@@ -88,12 +94,14 @@ def main() -> None:
 
     env = UAVSimpleTrainEnv()
 
+    if env.action_space.shape is None:
+        raise ValueError("Action space shape must be defined for TD3")
     n_actions = env.action_space.shape[-1]
     # TD3 常见做法：为每个动作维度设置同尺度高斯噪声。
     # 这里 sigma=0.2，表示在 [-1,1] 动作系数空间内提供适中的探索扰动。
     action_noise = NormalActionNoise(
         mean=np.zeros(n_actions, dtype=np.float32),
-        sigma=0.2 * np.ones(n_actions, dtype=np.float32),
+        sigma=0.1 * np.ones(n_actions, dtype=np.float32),
     )
 
     resume_mode = bool(args.resume_model)
@@ -109,6 +117,9 @@ def main() -> None:
             env=env,
             verbose=1,
             tensorboard_log=log_dir,
+            buffer_size=args.buffer_size,
+            optimize_memory_usage=True,
+            replay_buffer_kwargs={"handle_timeout_termination": False},
         )
         # 继续训练时显式恢复动作噪声，保证探索策略一致。
         model.action_noise = action_noise
@@ -128,11 +139,17 @@ def main() -> None:
         print(f"继续训练模型: {resume_zip} | 历史步数: {resume_base_steps}")
     else:
         model = TD3(
-            policy="MlpPolicy",
+            policy="CnnPolicy",
             env=env,
             action_noise=action_noise,
             verbose=1,
+            batch_size=128,
+            learning_rate=3e-4,
+            learning_starts=0,
             tensorboard_log=log_dir,
+            buffer_size=args.buffer_size,
+            optimize_memory_usage=True,
+            replay_buffer_kwargs={"handle_timeout_termination": False},
         )
         print("从头开始训练新模型")
 
