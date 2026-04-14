@@ -24,6 +24,8 @@ class UAVSimpleTrainEnv(gym.Env):
 		success_threshold: float = 2.0,
 		depth_feature_size: tuple[int, int] = (12, 12),
 		max_depth_m: float = 50.0,
+		drone_clearance: float = 2.0,
+		target_sample_max_retries: int = 50,
 	) -> None:
 		super().__init__()
 
@@ -50,9 +52,9 @@ class UAVSimpleTrainEnv(gym.Env):
 		self.previous_distance_from_des_point = 0
 
 		# AirSim 默认使用 NED 坐标系：x北向、y东向、z向下为正。
-		self.start_pos = np.array([0.0, 0.0, -30.0], dtype=np.float32)
-		self.target_min = np.array([10.0, -15.0, -40.0], dtype=np.float32)
-		self.target_max = np.array([30.0, 15.0, -20.0], dtype=np.float32)
+		self.start_pos = np.array([0.0, 0.0, -10.0], dtype=np.float32)
+		self.target_min = np.array([10.0, -15.0, -10.0], dtype=np.float32)
+		self.target_max = np.array([30.0, 15.0, -10.0], dtype=np.float32)
 
 		self.action_space = spaces.Box(
             low=np.array([
@@ -84,6 +86,10 @@ class UAVSimpleTrainEnv(gym.Env):
 		self.previous_action = np.zeros(4, dtype=np.float32)
 		self.current_action = np.zeros(4, dtype=np.float32)
 
+		self.drone_clearance = float(drone_clearance)
+		self.target_sample_max_retries = int(target_sample_max_retries)
+		self.home_geo = self.client.getHomeGeoPoint()
+
 	def _connect_client(self) -> None:
 		"""建立连接并获取控制权。"""
 		self.client.confirmConnection()
@@ -114,9 +120,46 @@ class UAVSimpleTrainEnv(gym.Env):
 		self.client.hoverAsync().join()
 		time.sleep(0.5)
 
+	def _ned_to_geo(self, ned_pos: np.ndarray) -> 'airsim.GeoPoint':
+		"""将 NED 局部坐标转换为 GeoPoint（flat-earth 近似）。"""
+		R = 6378137.0  # WGS84 地球半径（米）
+		lat_rad = math.radians(self.home_geo.latitude)
+		lat = self.home_geo.latitude + (ned_pos[0] / R) * (180.0 / math.pi)
+		lon = self.home_geo.longitude + (ned_pos[1] / (R * math.cos(lat_rad))) * (180.0 / math.pi)
+		alt = self.home_geo.altitude - ned_pos[2]  # NED z 向下为正，alt 向上为正
+		geo = airsim.GeoPoint()
+		geo.latitude = float(lat)
+		geo.longitude = float(lon)
+		geo.altitude = float(alt)
+		return geo
+
+	def _is_target_valid(self, point: np.ndarray) -> bool:
+		"""检查候选目标点是否在自由空间中且有足够间距。"""
+		target_geo = self._ned_to_geo(point)
+
+		# Phase 1: 从高空向下检查，确认点不在障碍物内部
+		sky_point = self._ned_to_geo(np.array([point[0], point[1], -200.0], dtype=np.float32))
+		if not self.client.simTestLineOfSightBetweenPoints(sky_point, target_geo):
+			return False
+
+		# Phase 2: 检查 drone_clearance 范围内 6 个方向无障碍物
+		directions = [(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)]
+		for dx, dy, dz in directions:
+			offset = np.array([dx, dy, dz], dtype=np.float32) * self.drone_clearance
+			end_geo = self._ned_to_geo(point + offset)
+			if not self.client.simTestLineOfSightBetweenPoints(target_geo, end_geo):
+				return False
+
+		return True
+
 	def _sample_target(self) -> np.ndarray:
-		"""在前方区域随机采样终点。"""
-		return self.np_random.uniform(self.target_min, self.target_max).astype(np.float32)
+		"""在前方区域随机采样终点（避开障碍物，保证机身间距）。"""
+		for _ in range(self.target_sample_max_retries):
+			candidate = self.np_random.uniform(self.target_min, self.target_max).astype(np.float32)
+			if self._is_target_valid(candidate):
+				return candidate
+		print(f'[WARN] 未能找到有效目标点（重试 {self.target_sample_max_retries} 次），使用最后候选点')
+		return candidate
 
 	def _get_kinematics(self) -> tuple[np.ndarray, np.ndarray]:
 		"""读取位置与速度（均在NED坐标系）。"""
@@ -371,6 +414,7 @@ class UAVSimpleTrainEnv(gym.Env):
 		current_pos, _ = self._get_kinematics()
 
 		self.prev_distance = self._compute_distance(current_pos, self.target_pos)
+		self.previous_distance_from_des_point = self._get_distance_to_goal_3d()
 		self.current_step = 0
 
 		obs = self._get_obs()
