@@ -4,6 +4,7 @@ from typing import Optional
 import airsim
 import gymnasium as gym
 import numpy as np
+import math
 from gymnasium import spaces
 
 from utils.image_processing import get_depth_feature
@@ -16,7 +17,7 @@ class UAVSimpleTrainEnv(gym.Env):
 	def __init__(
 		self,
 		max_speed: float = 5.0,
-		step_duration: float = 0.5,
+		step_duration: float = 0.1,
 		max_episode_steps: int = 200,
 		success_threshold: float = 2.0,
 		depth_feature_size: tuple[int, int] = (12, 12),
@@ -32,9 +33,9 @@ class UAVSimpleTrainEnv(gym.Env):
 		self.max_depth_m = float(max_depth_m)
 
 		# AirSim 默认使用 NED 坐标系：x北向、y东向、z向下为正。
-		self.start_pos = np.array([0.0, 0.0, -30.0], dtype=np.float32)
-		self.target_min = np.array([10.0, -15.0, -40.0], dtype=np.float32)
-		self.target_max = np.array([30.0, 15.0, -20.0], dtype=np.float32)
+		self.start_pos = np.array([0.0, 0.0, -50.0], dtype=np.float32)
+		self.target_min = np.array([10.0, -15.0, -50.0], dtype=np.float32)
+		self.target_max = np.array([30.0, 15.0, -50.0], dtype=np.float32)
 
 		self.action_space = spaces.Box(
 			low=-1.0,
@@ -87,7 +88,7 @@ class UAVSimpleTrainEnv(gym.Env):
 		# 极短时间内给一个速度为0的指令，消除重置前残留的惯性并避免下坠。
 		self.client.moveByVelocityAsync(0.0, 0.0, 0.0, duration=0.1).join()
 		self.client.hoverAsync().join()
-		time.sleep(0.5)
+		time.sleep(0.1)
 
 	def _sample_target(self) -> np.ndarray:
 		"""在前方区域随机采样终点。"""
@@ -164,15 +165,20 @@ class UAVSimpleTrainEnv(gym.Env):
 
 		action = np.asarray(action, dtype=np.float32).reshape(self.action_space.shape)
 		action = np.clip(action, self.action_space.low, self.action_space.high)
-		alpha = 0.6
+		alpha = 0.5
 		# 指数移动平均平滑动作，防止速度突变导致机身剧烈摇晃抖动（EMA）
 		action_smoothed = alpha * self.prev_action + (1-alpha) * action
 		self.prev_action = action_smoothed.copy()
 
 		# TD3 输出为 [-1,1]，缩放后映射到最大速度指令。
 		vx, vy, vz = (action_smoothed * self.max_speed).tolist()
+
+		# 计算速度向量的方向，并将偏航角对准该方向
+		yaw_angle = math.degrees(math.atan2(vy, vx))
+		yaw_mode = airsim.YawMode(is_rate=False, yaw_or_rate=yaw_angle)
+	
 		self.client.moveByVelocityAsync(
-			float(vx), float(vy), float(vz), duration=self.step_duration*1.25
+			float(vx), float(vy), float(vz), duration=self.step_duration*1.25, yaw_mode = yaw_mode
 		)
 		time.sleep(self.step_duration)
 
