@@ -33,13 +33,18 @@
             },
             "Sensors":  {
                 "Lidar1":  {
-                               "SensorType":  6,
-                               "Enabled":  true,
-                               "NumberOfChannels":  1,
-                               "RotationsPerSecond":  100,
-                               "PointsPerSecond":  36000,
-                               "DataFrame":  "SensorLocalFrame"
-                           }
+                    "SensorType": 6,
+                    "Enabled": true,
+                    "NumberOfChannels": 128,
+                    "Range": 30,
+                    "PointsPerSecond": 1280000,
+                    "VerticalFOVUpper": 10,
+                    "VerticalFOVLower": -30,
+                    "HorizontalFOVStart": -180,
+                    "HorizontalFOVEnd": 180,
+                    "DrawDebugPoints": true,
+                    "DataFrame": "SensorLocalFrame"
+                }
             }
         }
     }
