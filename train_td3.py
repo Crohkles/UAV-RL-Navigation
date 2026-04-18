@@ -61,6 +61,20 @@ def _extract_steps_from_checkpoint_name(path: str) -> int:
     return int(match.group(1))
 
 
+def _derive_replay_buffer_path_from_checkpoint(model_zip_path: str) -> str:
+    """按 SB3 CheckpointCallback 规则推导 replay buffer 路径。"""
+    file_name = os.path.basename(model_zip_path)
+    # SB3 命名规则: <name_prefix>_<steps>_steps.zip -> <name_prefix>_replay_buffer_<steps>_steps.pkl
+    match = re.search(r"^(?P<prefix>.+)_(?P<steps>\d+)_steps\.zip$", file_name)
+    if not match:
+        return ""
+
+    replay_file_name = (
+        f"{match.group('prefix')}_replay_buffer_{match.group('steps')}_steps.pkl"
+    )
+    return os.path.join(os.path.dirname(model_zip_path), replay_file_name)
+
+
 def _sanitize_run_name(raw: str) -> str:
     safe = re.sub(r"[^a-zA-Z0-9._-]+", "_", raw.strip())
     return safe.strip("_")
@@ -120,8 +134,8 @@ def main() -> None:
         model.num_timesteps = resume_base_steps
 
         # 若存在配套回放缓存则一并加载，可提升续训稳定性。
-        replay_path = resume_zip.replace(".zip", "_replay_buffer.pkl")
-        if os.path.exists(replay_path):
+        replay_path = _derive_replay_buffer_path_from_checkpoint(resume_zip)
+        if replay_path and os.path.exists(replay_path):
             model.load_replay_buffer(replay_path)
             print(f"已加载 replay buffer: {replay_path}")
 

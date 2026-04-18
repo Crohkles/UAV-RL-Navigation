@@ -42,7 +42,9 @@ if ($ForceRestart) {
 # 4) Headless launch args
 # -RenderOffscreen keeps camera rendering without opening a visible window.
 # -NoSound/-Unattended/-NoSplash reduce overhead for training.
+# -settings explicitly pins the config file, preventing fallback to cwd settings.json.
 $simArgs = @(
+    ('-settings="' + $settingsPath + '"'),
     "-RenderOffscreen",
     "-NoSound",
     "-Unattended",

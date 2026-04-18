@@ -80,7 +80,7 @@ python train_td3.py \
 
 - **检查点**: `models/checkpoints/<run_name>/td3_uav_simple_<steps>_steps.zip`
 - **最终模型**: `models/td3_uav_simple_final.zip`
-- **Replay Buffer**: `models/checkpoints/<run_name>/td3_uav_simple_<steps>_steps_replay_buffer.pkl`
+- **Replay Buffer**: `models/checkpoints/<run_name>/td3_uav_simple_replay_buffer_<steps>_steps.pkl`
 
 ## 模型测试
 
