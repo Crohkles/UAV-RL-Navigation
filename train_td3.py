@@ -5,7 +5,8 @@ from datetime import datetime
 
 import numpy as np
 from stable_baselines3 import TD3
-from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.callbacks import BaseCallback, CallbackList, CheckpointCallback
+from stable_baselines3.common.logger import TensorBoardOutputFormat
 from stable_baselines3.common.noise import NormalActionNoise
 
 from envs import UAVSimpleTrainEnv
@@ -78,6 +79,64 @@ def _derive_replay_buffer_path_from_checkpoint(model_zip_path: str) -> str:
 def _sanitize_run_name(raw: str) -> str:
     safe = re.sub(r"[^a-zA-Z0-9._-]+", "_", raw.strip())
     return safe.strip("_")
+
+
+class LossTensorboardCallback(BaseCallback):
+    """将 actor/critic loss 显式写入 TensorBoard，便于稳定可视化。"""
+
+    def __init__(self, verbose: int = 0) -> None:
+        super().__init__(verbose=verbose)
+        self._tb_writer = None
+        self._last_logged_step = -1
+        self._last_actor_loss = None
+        self._last_critic_loss = None
+
+    @staticmethod
+    def _to_scalar(value):
+        if isinstance(value, (float, int, np.floating, np.integer)):
+            return float(value)
+        return None
+
+    def _on_training_start(self) -> None:
+        for fmt in self.logger.output_formats:
+            if isinstance(fmt, TensorBoardOutputFormat):
+                self._tb_writer = fmt.writer
+                break
+
+        if self._tb_writer is None and self.verbose > 0:
+            print("[WARN] TensorBoard writer not found; actor/critic loss callback disabled.")
+
+    def _on_step(self) -> bool:
+        if self._tb_writer is None:
+            return True
+
+        metrics = getattr(self.model.logger, "name_to_value", {})
+        if not isinstance(metrics, dict):
+            return True
+
+        actor_loss = self._to_scalar(metrics.get("train/actor_loss"))
+        critic_loss = self._to_scalar(metrics.get("train/critic_loss"))
+
+        if actor_loss is None and critic_loss is None:
+            return True
+
+        current_step = int(getattr(self.model, "num_timesteps", self.num_timesteps))
+        if (
+            current_step == self._last_logged_step
+            and actor_loss == self._last_actor_loss
+            and critic_loss == self._last_critic_loss
+        ):
+            return True
+
+        if actor_loss is not None:
+            self._tb_writer.add_scalar("train/actor_loss", actor_loss, current_step)
+        if critic_loss is not None:
+            self._tb_writer.add_scalar("train/critic_loss", critic_loss, current_step)
+
+        self._last_logged_step = current_step
+        self._last_actor_loss = actor_loss
+        self._last_critic_loss = critic_loss
+        return True
 
 
 def main() -> None:
@@ -170,11 +229,13 @@ def main() -> None:
         save_replay_buffer=True,
         save_vecnormalize=False,
     )
+    loss_callback = LossTensorboardCallback()
+    callbacks = CallbackList([checkpoint_callback, loss_callback])
 
     model.learn(
         total_timesteps=args.total_timesteps,
         progress_bar=True,
-        callback=checkpoint_callback,
+        callback=callbacks,
         reset_num_timesteps=not resume_mode,
     )
 
