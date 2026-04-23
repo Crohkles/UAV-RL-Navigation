@@ -4,7 +4,6 @@ from typing import Optional
 import airsim
 import gymnasium as gym
 import numpy as np
-import math
 from gymnasium import spaces
 
 from utils.image_processing import get_depth_feature
@@ -17,7 +16,7 @@ class UAVSimpleTrainEnv(gym.Env):
 	def __init__(
 		self,
 		max_speed: float = 5.0,
-		step_duration: float = 0.1,
+		step_duration: float = 0.5,
 		max_episode_steps: int = 200,
 		success_threshold: float = 2.0,
 		depth_feature_size: tuple[int, int] = (12, 12),
@@ -40,12 +39,12 @@ class UAVSimpleTrainEnv(gym.Env):
 		self.action_space = spaces.Box(
 			low=-1.0,
 			high=1.0,
-			shape=(3,),
+			shape=(4,),
 			dtype=np.float32,
 		)
 
 		depth_dim = self.depth_feature_size[0] * self.depth_feature_size[1]
-		obs_dim = depth_dim + 3 + 3 + 3 # 增加3维用于 prev_action
+		obs_dim = depth_dim + 3 + 3 + 4 # 增加4维用于 prev_action(vx, vy, vz, yaw_rate)
 		self.observation_space = spaces.Box(
 			low=-1_000.0,
 			high=1_000.0,
@@ -58,8 +57,9 @@ class UAVSimpleTrainEnv(gym.Env):
 
 		self.target_pos = np.zeros(3, dtype=np.float32)
 		self.prev_distance = 0.0
+		self.best_distance = float("inf")
 		self.current_step = 0
-		self.prev_action = np.zeros(3, dtype=np.float32)
+		self.prev_action = np.zeros(4, dtype=np.float32)
 
 	def _connect_client(self) -> None:
 		"""建立连接并获取控制权。"""
@@ -126,7 +126,7 @@ class UAVSimpleTrainEnv(gym.Env):
 		1) 深度特征 144维
 		2) 当前速度 3维
 		3) 目标相对位移向量 3维
-		4) prev_action 3维
+		4) prev_action 4维(vx, vy, vz, yaw_rate)
 		"""
 		current_pos, current_vel = self._get_kinematics()
 		target_delta = (self.target_pos - current_pos).astype(np.float32)
@@ -150,8 +150,9 @@ class UAVSimpleTrainEnv(gym.Env):
 		current_pos, _ = self._get_kinematics()
 
 		self.prev_distance = self._compute_distance(current_pos, self.target_pos)
+		self.best_distance = self.prev_distance
 		self.current_step = 0
-		self.prev_action = np.zeros(3, dtype=np.float32)
+		self.prev_action = np.zeros(4, dtype=np.float32)
 
 		obs = self._get_obs()
 		info = {
@@ -170,12 +171,12 @@ class UAVSimpleTrainEnv(gym.Env):
 		action_smoothed = alpha * self.prev_action + (1-alpha) * action
 		self.prev_action = action_smoothed.copy()
 
-		# TD3 输出为 [-1,1]，缩放后映射到最大速度指令。
-		vx, vy, vz = (action_smoothed * self.max_speed).tolist()
+		# TD3 输出为 [-1,1]，前三维映射到速度指令，第四维映射到偏航角速度。
+		vx, vy, vz = (action_smoothed[:3] * self.max_speed).tolist()
+		yaw_rate_deg_s = float(action_smoothed[3] * 45.0)
 
-		# 计算速度向量的方向，并将偏航角对准该方向
-		yaw_angle = math.degrees(math.atan2(vy, vx))
-		yaw_mode = airsim.YawMode(is_rate=False, yaw_or_rate=yaw_angle)
+		# 偏航控制从手动绝对角改为动作直接输出偏航角速度。
+		yaw_mode = airsim.YawMode(is_rate=True, yaw_or_rate=yaw_rate_deg_s)
 	
 		self.client.moveByVelocityAsync(
 			float(vx), float(vy), float(vz), duration=self.step_duration*1.25, yaw_mode = yaw_mode
@@ -196,18 +197,17 @@ class UAVSimpleTrainEnv(gym.Env):
 			reward = 100.0
 			terminated = True
 		else:
-			# Dense Reward: 靠近目标的距离奖励 + 每步微小生存奖励。
-			progress_reward = self.prev_distance - distance_to_target
-			if progress_reward >= 0:
-				progress_reward *= 2.0
-			else:
-				# 减小远离惩罚
-				progress_reward = max(progress_reward, -0.5)
+			# 最高水位线法：仅当刷新“历史最近距离”时给予距离奖励。
+			improvement = self.best_distance - distance_to_target
+			progress_reward = max(improvement, 0.0) * 2.0
 			
-			reward = float(progress_reward + 0.03)
+			reward = float(progress_reward - 0.02)
 
 		if self.current_step >= self.max_episode_steps and not terminated:
 			truncated = True
+
+		if distance_to_target < self.best_distance:
+			self.best_distance = distance_to_target
 
 		self.prev_distance = distance_to_target
 		obs = self._get_obs()
@@ -219,6 +219,8 @@ class UAVSimpleTrainEnv(gym.Env):
 			"collision": bool(collision),
 			"raw_action": action.copy(),
 			"scaled_velocity_cmd": np.array([vx, vy, vz], dtype=np.float32),
+			"raw_yaw_rate_action": float(action[3]),
+			"scaled_yaw_rate_cmd_deg_s": yaw_rate_deg_s,
 		}
 		return obs, float(reward), terminated, truncated, info
 
