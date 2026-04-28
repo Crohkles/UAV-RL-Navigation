@@ -32,9 +32,9 @@ class UAVSimpleTrainEnv(gym.Env):
 		self.max_depth_m = float(max_depth_m)
 
 		# AirSim 默认使用 NED 坐标系：x北向、y东向、z向下为正。
-		self.start_pos = np.array([0.0, 0.0, -50.0], dtype=np.float32)
-		self.target_min = np.array([10.0, -15.0, -50.0], dtype=np.float32)
-		self.target_max = np.array([30.0, 15.0, -50.0], dtype=np.float32)
+		self.start_pos = np.array([0.0, 0.0, -5.0], dtype=np.float32)
+		self.target_min = np.array([10.0, -15.0, -3.0], dtype=np.float32)
+		self.target_max = np.array([30.0, 15.0, -7.0], dtype=np.float32)
 
 		self.action_space = spaces.Box(
 			low=-1.0,
@@ -83,16 +83,47 @@ class UAVSimpleTrainEnv(gym.Env):
 		)
 		self.client.simSetVehiclePose(pose, ignore_collision=True)
 
-		# 给予仿真器少量时间，避免瞬时状态读数抖动。
+		# # 给予仿真器少量时间，避免瞬时状态读数抖动。
 		time.sleep(0.08)
-		# 极短时间内给一个速度为0的指令，消除重置前残留的惯性并避免下坠。
+		# # 极短时间内给一个速度为0的指令，消除重置前残留的惯性并避免下坠。
 		self.client.moveByVelocityAsync(0.0, 0.0, 0.0, duration=0.1).join()
 		self.client.hoverAsync().join()
 		time.sleep(0.1)
 
+	def _is_target_collision_free(self, target: np.ndarray, clearance_m: float = 1.2) -> bool:
+		"""通过目标点局部净空检测，避免把终点采样到障碍物内部。"""
+		try:
+			for axis in range(3):
+				p_neg = target.copy()
+				p_pos = target.copy()
+				p_neg[axis] -= clearance_m
+				p_pos[axis] += clearance_m
+
+				visible = self.client.simTestLineOfSightBetweenPoints(
+					airsim.Vector3r(float(p_neg[0]), float(p_neg[1]), float(p_neg[2])),
+					airsim.Vector3r(float(p_pos[0]), float(p_pos[1]), float(p_pos[2])),
+				)
+				if not bool(visible):
+					return False
+		except Exception:
+			# 若仿真端暂不可用该接口，退化为允许该点，避免重置阶段中断。
+			return True
+
+		return True
+
 	def _sample_target(self) -> np.ndarray:
-		"""在前方区域随机采样终点。"""
-		return self.np_random.uniform(self.target_min, self.target_max).astype(np.float32)
+		"""在前方区域随机采样终点，并过滤掉障碍物占位点。"""
+		# 兼容各轴 min/max 书写顺序，避免 uniform 出现 high - low < 0。
+		sample_low = np.minimum(self.target_min, self.target_max)
+		sample_high = np.maximum(self.target_min, self.target_max)
+
+		last_candidate = self.np_random.uniform(sample_low, sample_high).astype(np.float32)
+		for _ in range(30):
+			candidate = self.np_random.uniform(sample_low, sample_high).astype(np.float32)
+			last_candidate = candidate
+			if self._is_target_collision_free(candidate):
+				return candidate
+		return last_candidate
 
 	def _get_kinematics(self) -> tuple[np.ndarray, np.ndarray]:
 		"""读取位置与速度（均在NED坐标系）。"""
@@ -166,7 +197,7 @@ class UAVSimpleTrainEnv(gym.Env):
 
 		action = np.asarray(action, dtype=np.float32).reshape(self.action_space.shape)
 		action = np.clip(action, self.action_space.low, self.action_space.high)
-		alpha = 0.5
+		alpha = 0.1
 		# 指数移动平均平滑动作，防止速度突变导致机身剧烈摇晃抖动（EMA）
 		action_smoothed = alpha * self.prev_action + (1-alpha) * action
 		self.prev_action = action_smoothed.copy()
@@ -202,6 +233,12 @@ class UAVSimpleTrainEnv(gym.Env):
 			progress_reward = max(improvement, 0.0) * 2.0
 			
 			reward = float(progress_reward - 0.02)
+
+			z_pos = current_pos[2]
+			if z_pos <= -9.0:
+				reward -= (-12.0 - z_pos) * 0.5
+			elif z_pos >= -1.0:
+				reward -= (z_pos - (-1.0)) * 0.5 
 
 		if self.current_step >= self.max_episode_steps and not terminated:
 			truncated = True
