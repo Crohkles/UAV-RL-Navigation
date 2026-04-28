@@ -289,17 +289,36 @@ def is_target_unique(candidate: np.ndarray, used_targets: List[np.ndarray]) -> b
     return True
 
 
-def sample_unique_target(
-    rng: np.random.Generator,
+def normalize_target_bounds(
     target_min: np.ndarray,
     target_max: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, bool]:
+    target_min_np = np.asarray(target_min, dtype=np.float32)
+    target_max_np = np.asarray(target_max, dtype=np.float32)
+
+    if target_min_np.shape != target_max_np.shape:
+        raise ValueError(
+            "Target bounds shape mismatch: "
+            f"min={target_min_np.shape}, max={target_max_np.shape}"
+        )
+
+    sample_low = np.minimum(target_min_np, target_max_np)
+    sample_high = np.maximum(target_min_np, target_max_np)
+    has_reversed_axis = bool(np.any(target_min_np > target_max_np))
+    return sample_low, sample_high, has_reversed_axis
+
+
+def sample_unique_target(
+    rng: np.random.Generator,
+    sample_low: np.ndarray,
+    sample_high: np.ndarray,
     used_targets: List[np.ndarray],
 ) -> np.ndarray:
     while True:
-        target = rng.uniform(target_min, target_max).astype(np.float32)
+        target = rng.uniform(sample_low, sample_high).astype(np.float32)
         if is_target_unique(target, used_targets):
             return target
-
+    # return np.array([20.0,0.0,-50.0],dtype=np.float32)
 
 def run_one_episode(
     env: UAVSimpleTrainEnv,
@@ -355,12 +374,23 @@ def main() -> None:
 
     rng = np.random.default_rng(args.seed)
     successful_targets: List[np.ndarray] = []
+    sample_low, sample_high, has_reversed_axis = normalize_target_bounds(
+        env.target_min,
+        env.target_max,
+    )
 
     print("=== AirSim policy test start ===")
     print(f"Model: {model_zip}")
     print(f"Start position (NED): {env.start_pos.tolist()}")
     print(f"Target range min: {env.target_min.tolist()}")
     print(f"Target range max: {env.target_max.tolist()}")
+    if has_reversed_axis:
+        print(
+            "[WARN] Detected reversed target bounds on at least one axis. "
+            "Sampling uses per-axis sorted bounds."
+        )
+        print(f"Sampling range low: {sample_low.tolist()}")
+        print(f"Sampling range high: {sample_high.tolist()}")
     print(f"Need successful targets: {args.num_targets}")
     print(f"Obs space shape: {env.observation_space.shape}")
     print(f"Act space shape: {env.action_space.shape}")
@@ -371,7 +401,7 @@ def main() -> None:
     total_attempts = 0
 
     while target_index < args.num_targets:
-        target = sample_unique_target(rng, env.target_min, env.target_max, successful_targets)
+        target = sample_unique_target(rng, sample_low, sample_high, successful_targets)
         print("\n----------------------------------------")
         print(
             f"Target #{target_index + 1} sampled (NED): "
