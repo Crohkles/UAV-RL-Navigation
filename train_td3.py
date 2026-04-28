@@ -48,6 +48,19 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _resolve_model_zip_path(path: str) -> str:
+    # 兼容历史模型：若用户给的是现有文件（即便非 .zip）则直接使用。
+    if os.path.exists(path):
+        return path
+    if path.endswith(".zip"):
+        return path
+    zip_path = f"{path}.zip"
+    if os.path.exists(zip_path):
+        return zip_path
+    return zip_path
+
+
+def _ensure_zip_model_path(path: str) -> str:
+    """显式确保模型保存路径为 .zip，避免版本号点位被误判为文件后缀。"""
     if path.endswith(".zip"):
         return path
     return f"{path}.zip"
@@ -240,14 +253,19 @@ def main() -> None:
     )
 
     # 保存两份：归档模型防覆盖 + 固定别名方便下次快速续训。
-    archived_model_path = os.path.join(model_dir, f"{args.save_name}_{run_name}")
-    latest_model_path = os.path.join(model_dir, args.save_name)
+    archived_stem = (
+        f"{args.save_name}_{stamp}"
+        if run_name == args.save_name
+        else f"{args.save_name}_{run_name}"
+    )
+    archived_model_path = _ensure_zip_model_path(os.path.join(model_dir, archived_stem))
+    latest_model_path = _ensure_zip_model_path(os.path.join(model_dir, args.save_name))
     model.save(archived_model_path)
     model.save(latest_model_path)
     env.close()
 
-    print(f"训练完成，归档模型: {archived_model_path}.zip")
-    print(f"训练完成，最新模型别名: {latest_model_path}.zip")
+    print(f"训练完成，归档模型: {archived_model_path}")
+    print(f"训练完成，最新模型别名: {latest_model_path}")
     print(f"自动 checkpoint 目录: {checkpoint_dir}")
     print(f"checkpoint 保存频率: 每 {args.checkpoint_freq} timesteps")
     print(f"TensorBoard 日志目录: {log_dir}")
