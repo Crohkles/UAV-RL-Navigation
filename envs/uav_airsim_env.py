@@ -1,5 +1,7 @@
+import json
+import os
 import time
-from typing import Optional
+from typing import Optional, Sequence
 
 import airsim
 import gymnasium as gym
@@ -21,6 +23,8 @@ class UAVSimpleTrainEnv(gym.Env):
 		success_threshold: float = 2.0,
 		depth_feature_size: tuple[int, int] = (12, 12),
 		max_depth_m: float = 50.0,
+		spawn_points_json: Optional[str] = None,
+		goal_distance_range: Optional[Sequence[float]] = None,
 	) -> None:
 		super().__init__()
 
@@ -35,6 +39,20 @@ class UAVSimpleTrainEnv(gym.Env):
 		self.start_pos = np.array([0.0, 0.0, -5.0], dtype=np.float32)
 		self.target_min = np.array([10.0, -15.0, -3.0], dtype=np.float32)
 		self.target_max = np.array([30.0, 15.0, -7.0], dtype=np.float32)
+
+		self._spawn_points: list[np.ndarray] = []
+		self._use_spawn_points = False
+		self.goal_distance_range: Optional[tuple[float, float]] = None
+		if spawn_points_json:
+			self._spawn_points = self._load_spawn_points(spawn_points_json)
+			if goal_distance_range is None:
+				raise ValueError(
+					"goal_distance_range is required when spawn_points_json is set."
+				)
+			self.goal_distance_range = self._normalize_goal_distance_range(
+				goal_distance_range
+			)
+			self._use_spawn_points = True
 
 		self.action_space = spaces.Box(
 			low=-1.0,
@@ -66,6 +84,83 @@ class UAVSimpleTrainEnv(gym.Env):
 		self.client.confirmConnection()
 		self.client.enableApiControl(True)
 		self.client.armDisarm(True)
+
+	def _load_spawn_points(self, spawn_points_json: str) -> list[np.ndarray]:
+		path = os.path.abspath(spawn_points_json)
+		if not os.path.exists(path):
+			raise FileNotFoundError(f"Spawn points JSON not found: {path}")
+		with open(path, "r", encoding="utf-8") as handle:
+			payload = json.load(handle)
+
+		if isinstance(payload, dict):
+			points_payload = payload.get("points", [])
+		elif isinstance(payload, list):
+			points_payload = payload
+		else:
+			raise ValueError("Spawn points JSON must be a list or dict payload.")
+
+		points: list[np.ndarray] = []
+		for idx, item in enumerate(points_payload, start=1):
+			if not isinstance(item, dict):
+				raise ValueError(f"Invalid spawn point at index {idx}: {item}")
+			if not all(key in item for key in ("x", "y", "z")):
+				raise ValueError(
+					f"Spawn point at index {idx} missing x/y/z fields: {item}"
+				)
+			points.append(
+				np.array(
+					[
+						float(item["x"]),
+						float(item["y"]),
+						float(item["z"]),
+					],
+					dtype=np.float32,
+				)
+			)
+
+		if not points:
+			raise ValueError(f"No valid spawn points found in: {path}")
+		return points
+
+	def _normalize_goal_distance_range(self, values: Sequence[float]) -> tuple[float, float]:
+		if len(values) != 2:
+			raise ValueError("goal_distance_range must have exactly two numbers.")
+		low = float(values[0])
+		high = float(values[1])
+		if low < 0 or high < 0:
+			raise ValueError("goal_distance_range values must be >= 0.")
+		if high < low:
+			low, high = high, low
+		if high <= 0:
+			raise ValueError("goal_distance_range max must be > 0.")
+		return low, high
+
+	def _sample_spawn_point(self) -> np.ndarray:
+		idx = int(self.np_random.integers(0, len(self._spawn_points)))
+		return self._spawn_points[idx].copy()
+
+	def _sample_target_near_start(self, start_pos: np.ndarray) -> np.ndarray:
+		if self.goal_distance_range is None:
+			raise RuntimeError("goal_distance_range not configured for spawn-point mode.")
+		min_dist, max_dist = self.goal_distance_range
+
+		last_candidate = start_pos.copy().astype(np.float32)
+		for _ in range(30):
+			radius = float(
+				np.sqrt(self.np_random.uniform(min_dist**2, max_dist**2))
+			)
+			angle = float(self.np_random.uniform(0.0, 2.0 * np.pi))
+			dx = radius * float(np.cos(angle))
+			dy = radius * float(np.sin(angle))
+			dz = float(self.np_random.uniform(-2.0, 2.0))
+			candidate = np.array(
+				[start_pos[0] + dx, start_pos[1] + dy, start_pos[2] + dz],
+				dtype=np.float32,
+			)
+			last_candidate = candidate
+			if self._is_target_collision_free(candidate):
+				return candidate
+		return last_candidate
 
 	def _safe_reset_vehicle(self) -> None:
 		"""按回合重置无人机，并强制传送到固定起飞点。"""
@@ -176,8 +271,13 @@ class UAVSimpleTrainEnv(gym.Env):
 		del options
 		super().reset(seed=seed)
 
+		if self._use_spawn_points:
+			self.start_pos = self._sample_spawn_point()
 		self._safe_reset_vehicle()
-		self.target_pos = self._sample_target()
+		if self._use_spawn_points:
+			self.target_pos = self._sample_target_near_start(self.start_pos)
+		else:
+			self.target_pos = self._sample_target()
 		current_pos, _ = self._get_kinematics()
 
 		self.prev_distance = self._compute_distance(current_pos, self.target_pos)
@@ -235,10 +335,13 @@ class UAVSimpleTrainEnv(gym.Env):
 			reward = float(progress_reward - 0.02)
 
 			z_pos = current_pos[2]
-			if z_pos <= -9.0:
-				reward -= (-12.0 - z_pos) * 0.5
-			elif z_pos >= -1.0:
-				reward -= (z_pos - (-1.0)) * 0.5 
+			start_z = self.start_pos[2]
+			rel_z = z_pos - start_z
+
+			if rel_z <= -5.0:
+				reward -= (-5.0 - rel_z) * 0.5
+			elif rel_z >= 4.0:
+				reward -= (rel_z - 4.0) * 0.5 
 
 		if self.current_step >= self.max_episode_steps and not terminated:
 			truncated = True

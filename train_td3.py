@@ -44,6 +44,26 @@ def _parse_args() -> argparse.Namespace:
         default="",
         help="Optional run name. If empty, script auto-generates one.",
     )
+    parser.add_argument(
+        "--spawn-points-json",
+        type=str,
+        default="",
+        help=(
+            "Optional path to spawn_points.json. When set, each episode starts from a "
+            "random spawn point in the file. Requires --goal-distance-range."
+        ),
+    )
+    parser.add_argument(
+        "--goal-distance-range",
+        type=float,
+        nargs=2,
+        default=None,
+        metavar=("MIN", "MAX"),
+        help=(
+            "Distance range (meters) for random target sampling around the spawn point. "
+            "Z uses spawn_z +/- 2. Requires --spawn-points-json."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -172,7 +192,18 @@ def main() -> None:
     os.makedirs(model_dir, exist_ok=True)
     os.makedirs(checkpoint_root, exist_ok=True)
 
-    env = UAVSimpleTrainEnv()
+    if bool(args.spawn_points_json) ^ bool(args.goal_distance_range):
+        raise ValueError(
+            "--spawn-points-json and --goal-distance-range must be set together to enable "
+            "spawn-point training."
+        )
+
+    env_kwargs = {}
+    if args.spawn_points_json:
+        env_kwargs["spawn_points_json"] = args.spawn_points_json
+        env_kwargs["goal_distance_range"] = args.goal_distance_range
+
+    env = UAVSimpleTrainEnv(**env_kwargs) if env_kwargs else UAVSimpleTrainEnv()
 
     n_actions = env.action_space.shape[-1]
     # TD3 常见做法：为每个动作维度设置同尺度高斯噪声。

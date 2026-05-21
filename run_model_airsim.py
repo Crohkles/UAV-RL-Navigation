@@ -63,6 +63,26 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--spawn-points-json",
+        type=str,
+        default="",
+        help=(
+            "Optional path to spawn_points.json. When set, each target uses a fixed "
+            "spawn point sampled from the file. Requires --goal-distance-range."
+        ),
+    )
+    parser.add_argument(
+        "--goal-distance-range",
+        type=float,
+        nargs=2,
+        default=None,
+        metavar=("MIN", "MAX"),
+        help=(
+            "Distance range (meters) for random target sampling around the spawn point. "
+            "Z uses spawn_z +/- 2. Requires --spawn-points-json."
+        ),
+    )
+    parser.add_argument(
         "--show-reward-breakdown",
         action="store_true",
         help="Print reward/penalty/bonus terms from env info when available.",
@@ -320,6 +340,54 @@ def sample_unique_target(
             return target
     # return np.array([20.0,0.0,-50.0],dtype=np.float32)
 
+
+def get_spawn_points_from_env(env: UAVSimpleTrainEnv) -> List[np.ndarray]:
+    points = getattr(env, "_spawn_points", None)
+    if not isinstance(points, list) or not points:
+        raise RuntimeError("spawn_points_json enabled but no spawn points loaded")
+    return [np.asarray(p, dtype=np.float32) for p in points]
+
+
+def sample_spawn_point(
+    rng: np.random.Generator,
+    spawn_points: List[np.ndarray],
+) -> np.ndarray:
+    idx = int(rng.integers(0, len(spawn_points)))
+    return spawn_points[idx].astype(np.float32).copy()
+
+
+def sample_target_near_start(
+    rng: np.random.Generator,
+    start_pos: np.ndarray,
+    goal_distance_range: Tuple[float, float],
+    used_targets: List[np.ndarray],
+    collision_check: bool,
+    env: UAVSimpleTrainEnv,
+) -> np.ndarray:
+    min_dist, max_dist = float(goal_distance_range[0]), float(goal_distance_range[1])
+    last_candidate = start_pos.copy().astype(np.float32)
+
+    for _ in range(60):
+        radius = float(np.sqrt(rng.uniform(min_dist**2, max_dist**2)))
+        angle = float(rng.uniform(0.0, 2.0 * np.pi))
+        dx = radius * float(np.cos(angle))
+        dy = radius * float(np.sin(angle))
+        dz = float(rng.uniform(-2.0, 2.0))
+        candidate = np.array(
+            [start_pos[0] + dx, start_pos[1] + dy, start_pos[2] + dz],
+            dtype=np.float32,
+        )
+        last_candidate = candidate
+
+        if not is_target_unique(candidate, used_targets):
+            continue
+        if collision_check and hasattr(env, "_is_target_collision_free"):
+            if not bool(env._is_target_collision_free(candidate)):
+                continue
+        return candidate
+
+    return last_candidate
+
 def run_one_episode(
     env: UAVSimpleTrainEnv,
     model: BaseAlgorithm,
@@ -363,6 +431,14 @@ def main() -> None:
         raise FileNotFoundError(f"Model not found: {model_zip}")
 
     env_kwargs = parse_env_kwargs_json(args.env_kwargs_json)
+    if bool(args.spawn_points_json) ^ bool(args.goal_distance_range):
+        raise ValueError(
+            "--spawn-points-json and --goal-distance-range must be set together to enable "
+            "spawn-point evaluation."
+        )
+    if args.spawn_points_json:
+        env_kwargs["spawn_points_json"] = args.spawn_points_json
+        env_kwargs["goal_distance_range"] = args.goal_distance_range
     env = build_env(env_kwargs)
     model = TD3.load(model_zip)
     validate_model_env_spaces(model, env)
@@ -378,6 +454,16 @@ def main() -> None:
         env.target_min,
         env.target_max,
     )
+    use_spawn_points = bool(env_kwargs.get("spawn_points_json"))
+    spawn_points: List[np.ndarray] = []
+    original_spawn_points: List[np.ndarray] = []
+    goal_distance_range = None
+    if use_spawn_points:
+        spawn_points = get_spawn_points_from_env(env)
+        original_spawn_points = [p.copy() for p in spawn_points]
+        goal_distance_range = getattr(env, "goal_distance_range", None)
+        if goal_distance_range is None:
+            raise RuntimeError("Spawn-point mode enabled but goal_distance_range missing")
 
     print("=== AirSim policy test start ===")
     print(f"Model: {model_zip}")
@@ -396,12 +482,31 @@ def main() -> None:
     print(f"Act space shape: {env.action_space.shape}")
     if env_kwargs:
         print(f"Env kwargs overrides: {env_kwargs}")
+    if use_spawn_points:
+        print(
+            "Spawn-point mode: each target samples a fixed start point, "
+            f"goal distance range={list(goal_distance_range)}"
+        )
 
     target_index = 0
     total_attempts = 0
 
     while target_index < args.num_targets:
-        target = sample_unique_target(rng, sample_low, sample_high, successful_targets)
+        if use_spawn_points:
+            start_pos = sample_spawn_point(rng, spawn_points)
+            target = sample_target_near_start(
+                rng=rng,
+                start_pos=start_pos,
+                goal_distance_range=goal_distance_range,
+                used_targets=successful_targets,
+                collision_check=True,
+                env=env,
+            )
+            if hasattr(env, "_spawn_points"):
+                env._spawn_points = [start_pos.copy()]
+            env.start_pos = start_pos.copy()
+        else:
+            target = sample_unique_target(rng, sample_low, sample_high, successful_targets)
         print("\n----------------------------------------")
         print(
             f"Target #{target_index + 1} sampled (NED): "
@@ -414,6 +519,11 @@ def main() -> None:
         while not target_success:
             attempt += 1
             total_attempts += 1
+
+            if use_spawn_points:
+                if hasattr(env, "_spawn_points"):
+                    env._spawn_points = [start_pos.copy()]
+                env.start_pos = start_pos.copy()
 
             success, info = run_one_episode(
                 env=env,
@@ -460,6 +570,9 @@ def main() -> None:
                         "Reached max attempts for one target without success. "
                         "Increase --max-attempts-per-target or use a better checkpoint."
                     )
+
+        if use_spawn_points and hasattr(env, "_spawn_points"):
+            env._spawn_points = [p.copy() for p in original_spawn_points]
 
     print("\n========================================")
     print("Test finished.")
