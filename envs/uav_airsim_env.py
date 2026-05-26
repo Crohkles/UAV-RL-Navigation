@@ -262,6 +262,30 @@ class UAVSimpleTrainEnv(gym.Env):
 		)
 		return obs
 
+	def set_navigation_target(
+		self,
+		target: np.ndarray,
+		segment_start: Optional[np.ndarray] = None,
+	) -> np.ndarray:
+		"""Update a local navigation target without resetting continuous flight state."""
+		target_vec = np.asarray(target, dtype=np.float32)
+		if target_vec.shape != (3,):
+			raise ValueError(f"Navigation target must have shape (3,), got {target_vec.shape}")
+
+		if segment_start is not None:
+			start_vec = np.asarray(segment_start, dtype=np.float32)
+			if start_vec.shape != (3,):
+				raise ValueError(
+					f"Segment start must have shape (3,), got {start_vec.shape}"
+				)
+			self.start_pos = start_vec.copy()
+
+		self.target_pos = target_vec.copy()
+		current_pos, _ = self._get_kinematics()
+		self.prev_distance = self._compute_distance(current_pos, self.target_pos)
+		self.best_distance = self.prev_distance
+		return self._get_obs()
+
 	def reset(
 		self,
 		*,

@@ -1,0 +1,38 @@
+planner:
+  map_path: ./small_city_height.tif
+  pixel_to_airsim_matrix: ./matrix.json
+  obstacle_height_threshold: 45
+  height_channel: r
+  waypoint_stride: 10
+  planning_mode: 3d
+  height_weight: 8.0
+  height_lift_coef: 0.3
+  max_segment_altitude_delta: 4.0
+
+paths:
+  paths_json: ./paths.json
+  height: -50.0
+
+env:
+  max_episode_steps: 800
+  success_threshold: 0.0
+
+eval:
+  num_episodes: -1
+  model_path: ../models/checkpoints/td3-vision-v2.1.2/td3-vision-v2.1.2_ckpt_195000_steps.zip
+  model_algo: TD3
+  deterministic: true
+  max_steps_per_episode: 500
+  waypoint_tolerance: 2.0
+  output_json: ./eval_results.json
+  log_level: INFO
+  seed: 42
+  shuffle_paths: false
+  visualize: true
+  visualize_step_interval: 1
+  visualize_pause_sec: 0.001
+  visualize_window_scale: 1
+  interactive_vertical_speed: 5.0
+  interactive_takeoff_clearance: 0.5
+  interactive_landing_clearance: 1.5
+  interactive_landing_timeout_sec: 60.0
