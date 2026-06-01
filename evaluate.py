@@ -452,21 +452,28 @@ class EpisodeExecutor:
                 reason = "takeoff_failed"
 
         if not phase_failed:
-            current_wp_idx, completed_waypoints, obs, success, _ = (
-                self._advance_reached_waypoints(
-                    episode_id=episode_id,
-                    plan=plan,
-                    current_pos=prev_pos,
-                    current_wp_idx=current_wp_idx,
-                    completed_waypoints=completed_waypoints,
-                    obs=obs,
-                    activate_target=True,
+            if self._visualizer_cancelled():
+                phase_failed = True
+                reason = "user_closed"
+            else:
+                current_wp_idx, completed_waypoints, obs, success, _ = (
+                    self._advance_reached_waypoints(
+                        episode_id=episode_id,
+                        plan=plan,
+                        current_pos=prev_pos,
+                        current_wp_idx=current_wp_idx,
+                        completed_waypoints=completed_waypoints,
+                        obs=obs,
+                        activate_target=True,
+                    )
                 )
-            )
-            if success:
-                reason = "success"
+                if success:
+                    reason = "success"
 
         while not phase_failed and not success and steps < self.max_steps:
+            if self._visualizer_cancelled():
+                reason = "user_closed"
+                break
             action = self.navigator.predict(obs)
             step_out = self.env.step(action)
             obs, _reward, terminated, truncated, info = parse_step_output(step_out)
@@ -514,7 +521,10 @@ class EpisodeExecutor:
             timeout = True
             reason = "max_steps"
 
-        if success and interactive_profile is not None:
+        if success and interactive_profile is not None and self._visualizer_cancelled():
+            success = False
+            reason = "user_closed"
+        elif success and interactive_profile is not None:
             try:
                 landing_pos = self._execute_interactive_landing(
                     episode_id=episode_id,
@@ -566,6 +576,13 @@ class EpisodeExecutor:
             reason=reason,
         )
         return result
+
+    def _visualizer_cancelled(self) -> bool:
+        return (
+            self.visualizer is not None
+            and hasattr(self.visualizer, "is_run_cancelled")
+            and self.visualizer.is_run_cancelled()
+        )
 
     def _execute_interactive_takeoff(
         self,
@@ -869,6 +886,10 @@ class MapVisualizer:
         self.selection_active = False
         self.selection_confirmed = False
         self.selection_cancelled = False
+        self.reset_requested = False
+        self.running_active = False
+        self.completed_active = False
+        self.run_cancelled = False
         self.selection_points: List[Tuple[int, int]] = []
         self._photo_image = None
 
@@ -896,6 +917,13 @@ class MapVisualizer:
             text="Confirm",
             width=12,
             command=self._confirm_selection,
+            state=tk.DISABLED,
+        )
+        self.reset_button = tk.Button(
+            self.action_frame,
+            text="Reset",
+            width=12,
+            command=self._request_reset,
             state=tk.DISABLED,
         )
 
@@ -950,11 +978,67 @@ class MapVisualizer:
         self._draw_marker(end_pixel, (0, 255, 0), "G")
         self._render()
 
+    def clear_map(self) -> None:
+        self.current_map = self.base_map.copy()
+        self.prev_pixel = None
+        self.selection_points.clear()
+        self.selection_confirmed = False
+        self.selection_cancelled = False
+        self._render()
+
+    def begin_run(self) -> None:
+        self.running_active = True
+        self.completed_active = False
+        self.run_cancelled = False
+        self.reset_requested = False
+        self.confirm_button.configure(state=self._tk.DISABLED)
+        self.reset_button.configure(state=self._tk.DISABLED)
+        self.reset_button.pack_forget()
+        self.hint_label.configure(text="Evaluation running... close window to stop.")
+        self._process_gui_events()
+
+    def is_run_cancelled(self) -> bool:
+        return self.closed or self.run_cancelled
+
+    def enter_completed_state(self, message: str) -> None:
+        if self.closed:
+            return
+        self.running_active = False
+        self.completed_active = True
+        self.run_cancelled = False
+        self.reset_requested = False
+        self.confirm_button.configure(state=self._tk.DISABLED)
+        self.confirm_button.pack_forget()
+        self.reset_button.configure(state=self._tk.NORMAL)
+        self.reset_button.pack(side=self._tk.RIGHT, padx=(8, 0))
+        self.hint_label.configure(text=message)
+        self._process_gui_events()
+
+    def wait_for_reset_or_close(self) -> str:
+        if self.closed:
+            return "close"
+        while not (self.reset_requested or self.closed):
+            self._process_gui_events()
+            time.sleep(self.pause_ms / 1000.0)
+        if self.reset_requested and not self.closed:
+            self.completed_active = False
+            self.reset_requested = False
+            self.reset_button.configure(state=self._tk.DISABLED)
+            self.reset_button.pack_forget()
+            self.clear_map()
+            return "reset"
+        return "close"
+
     def select_start_goal(self, z_value: float) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         self.selection_active = True
         self.selection_confirmed = False
         self.selection_cancelled = False
+        self.completed_active = False
+        self.running_active = False
+        self.run_cancelled = False
         self.selection_points.clear()
+        self.reset_button.configure(state=self._tk.DISABLED)
+        self.reset_button.pack_forget()
         self.confirm_button.configure(state=self._tk.DISABLED)
         self.confirm_button.pack(side=self._tk.RIGHT, padx=(8, 0))
         self.hint_label.configure(
@@ -1139,9 +1223,16 @@ class MapVisualizer:
         if self.selection_active and len(self.selection_points) >= 2:
             self.selection_confirmed = True
 
+    def _request_reset(self) -> None:
+        if self.completed_active:
+            self.reset_requested = True
+
     def _cancel_or_close(self) -> None:
         if self.selection_active:
             self.selection_cancelled = True
+        elif self.running_active:
+            self.run_cancelled = True
+            self.close()
         else:
             self.close()
 
@@ -1658,6 +1749,187 @@ def build_interactive_flight_profile(
     )
 
 
+def make_planning_failed_result(
+    episode_id: int,
+    path_pair: PathPair,
+    reason: str = "planning_failed",
+) -> EpisodeResult:
+    return EpisodeResult(
+        episode_id=episode_id,
+        path_id=path_pair.path_id,
+        success=False,
+        collision=False,
+        timeout=True,
+        planning_failed=True,
+        failed=True,
+        steps=0,
+        duration_sec=0.0,
+        ideal_path_length=0.0,
+        actual_path_length=0.0,
+        spl=0.0,
+        waypoint_count=0,
+        completed_waypoints=0,
+        start=path_pair.start.tolist(),
+        end=path_pair.end.tolist(),
+        final_position=None,
+        final_distance_to_goal=None,
+        reason=reason,
+    )
+
+
+def log_episode_result(logger: logging.Logger, result: EpisodeResult) -> None:
+    logger.info(
+        "Episode %d result: success=%s collision=%s timeout=%s steps=%d "
+        "spl=%.3f final_dist=%s reason=%s",
+        result.episode_id,
+        result.success,
+        result.collision,
+        result.timeout,
+        result.steps,
+        result.spl,
+        (
+            f"{result.final_distance_to_goal:.2f}"
+            if result.final_distance_to_goal is not None
+            else "n/a"
+        ),
+        result.reason,
+    )
+
+
+def reset_interactive_aircraft_state(
+    env: UAVSimpleTrainEnv,
+    logger: logging.Logger,
+) -> None:
+    logger.info("Resetting interactive aircraft state for the next selection.")
+    client = getattr(env, "client", None)
+    if client is not None:
+        try:
+            if hasattr(client, "hoverAsync"):
+                client.hoverAsync().join()
+        except Exception as exc:
+            logger.debug("Ignoring hover failure during interactive reset: %s", exc)
+        try:
+            if hasattr(client, "reset"):
+                client.reset()
+        except Exception as exc:
+            logger.warning("AirSim client reset failed during interactive reset: %s", exc)
+        try:
+            if hasattr(client, "enableApiControl"):
+                client.enableApiControl(True)
+            if hasattr(client, "armDisarm"):
+                client.armDisarm(True)
+        except Exception as exc:
+            logger.warning("Failed to re-enable AirSim API control after reset: %s", exc)
+
+    if hasattr(env, "current_step"):
+        env.current_step = 0
+    if hasattr(env, "prev_action"):
+        env.prev_action = np.zeros_like(np.asarray(env.prev_action, dtype=np.float32))
+    if hasattr(env, "prev_distance"):
+        env.prev_distance = 0.0
+    if hasattr(env, "best_distance"):
+        env.best_distance = float("inf")
+    if hasattr(env, "target_pos"):
+        env.target_pos = np.zeros(3, dtype=np.float32)
+
+
+def run_interactive_evaluation_loop(
+    visualizer: "MapVisualizer",
+    env: UAVSimpleTrainEnv,
+    executor: EpisodeExecutor,
+    a_star: AStarPlanner,
+    mapper: PixelToAirSimMatrixMapper,
+    planner_cfg: PlannerConfig,
+    paths_cfg: PathsConfig,
+    eval_cfg: EvalConfig,
+    logger: logging.Logger,
+) -> None:
+    round_idx = 1
+    logger.info(
+        "Starting interactive evaluation loop, planning_mode=%s. "
+        "Close the window to exit.",
+        planner_cfg.planning_mode,
+    )
+
+    while not visualizer.closed:
+        z_up = float(paths_cfg.height) if paths_cfg.height is not None else -5.0
+        logger.info("----- Interactive round %d: select start and goal -----", round_idx)
+        visualizer.clear_map()
+        selection = visualizer.select_start_goal(z_up)
+        if selection is None:
+            logger.info("Interactive selection cancelled or window closed.")
+            break
+
+        start, end = selection
+        path_pair = PathPair(start=start, end=end, path_id=None, distance=None)
+        planner = GlobalPlanner(
+            planner=a_star,
+            mapper=mapper,
+            waypoint_stride=planner_cfg.waypoint_stride,
+            z_up=z_up,
+            planning_mode=planner_cfg.planning_mode,
+            height_lift_coef=planner_cfg.height_lift_coef,
+            max_segment_altitude_delta=planner_cfg.max_segment_altitude_delta,
+        )
+
+        try:
+            plan = planner.plan(path_pair.start, path_pair.end)
+            interactive_profile = build_interactive_flight_profile(
+                a_star, mapper, path_pair, eval_cfg, logger
+            )
+        except Exception as exc:
+            logger.error("Interactive round %d planning failed: %s", round_idx, exc)
+            result = make_planning_failed_result(round_idx, path_pair)
+            log_episode_result(logger, result)
+            visualizer.enter_completed_state(
+                "Planning failed. Click Reset to select a new path, or close to exit."
+            )
+            action = visualizer.wait_for_reset_or_close()
+            if action == "reset":
+                reset_interactive_aircraft_state(env, logger)
+                round_idx += 1
+                continue
+            break
+
+        z_values = [float(waypoint[2]) for waypoint in plan.waypoints]
+        raw_z_range = plan.raw_altitude_range or (min(z_values), max(z_values))
+        logger.info(
+            "Interactive round %d plan: mode=%s, waypoints=%d, ideal_len=%.2f, "
+            "raw_z_range=[%.2f, %.2f], execution_z_range=[%.2f, %.2f], "
+            "transition_waypoints=%d",
+            round_idx,
+            planner_cfg.planning_mode,
+            len(plan.waypoints),
+            plan.ideal_length,
+            raw_z_range[0],
+            raw_z_range[1],
+            min(z_values),
+            max(z_values),
+            plan.inserted_transition_waypoint_count,
+        )
+
+        visualizer.begin_run()
+        result = executor.run_episode(
+            round_idx,
+            path_pair,
+            plan,
+            interactive_profile=interactive_profile,
+        )
+        log_episode_result(logger, result)
+
+        if visualizer.closed:
+            break
+        visualizer.enter_completed_state(
+            "Evaluation finished. Click Reset to select a new path, or close to exit."
+        )
+        action = visualizer.wait_for_reset_or_close()
+        if action == "reset":
+            reset_interactive_aircraft_state(env, logger)
+            round_idx += 1
+            continue
+        break
+
+
 def resolve_model_path(path: str) -> str:
     if not path:
         return path
@@ -1726,16 +1998,6 @@ def main() -> None:
     if eval_cfg.interactive_select:
         if visualizer is None:
             raise RuntimeError("Interactive selection requires visualization")
-        z_up = float(paths_cfg.height) if paths_cfg.height is not None else -5.0
-        selection = visualizer.select_start_goal(z_up)
-        if selection is None:
-            logger.info("Interactive selection cancelled.")
-            if visualizer is not None:
-                visualizer.close()
-            return
-        start, end = selection
-        path_pairs = [PathPair(start=start, end=end, path_id=None, distance=None)]
-        selected_paths = path_pairs
         meta: Dict[str, Any] = {}
     else:
         logger.info("Loading paths: %s", paths_cfg.paths_json)
@@ -1775,6 +2037,23 @@ def main() -> None:
         logger=logger,
         visualizer=visualizer,
     )
+
+    if eval_cfg.interactive_select:
+        run_interactive_evaluation_loop(
+            visualizer=visualizer,
+            env=env,
+            executor=executor,
+            a_star=a_star,
+            mapper=mapper,
+            planner_cfg=planner_cfg,
+            paths_cfg=paths_cfg,
+            eval_cfg=eval_cfg,
+            logger=logger,
+        )
+        env.close()
+        if visualizer is not None:
+            visualizer.close()
+        return
 
     metrics = MetricsTracker()
 
@@ -1891,11 +2170,6 @@ def main() -> None:
 
     env.close()
     if visualizer is not None:
-        if eval_cfg.interactive_select and not visualizer.closed:
-            logger.info(
-                "Interactive execution finished. Close the visualization window to exit."
-            )
-            visualizer.wait_until_closed()
         visualizer.close()
 
 
