@@ -22,7 +22,7 @@ eval:
   model_path: ../models/checkpoints/td3-vision-v2.1.2/td3-vision-v2.1.2_ckpt_195000_steps.zip
   model_algo: TD3
   deterministic: true
-  max_steps_per_episode: 500
+  max_steps_per_episode: 800
   waypoint_tolerance: 2.0
   output_json: ./eval_results.json
   log_level: INFO
