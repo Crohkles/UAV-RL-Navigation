@@ -3,6 +3,8 @@ planner:
   pixel_to_airsim_matrix: ./matrix.json
   obstacle_height_threshold: 45
   height_channel: r
+  clearance_cost_weight: 20.0
+  clearance_cost_radius: 6.0
   waypoint_stride: 10
   planning_mode: 3d
   height_weight: 8.0

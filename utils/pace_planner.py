@@ -25,10 +25,14 @@ class AStarPlanner:
         map_path: str,
         obstacle_height_threshold: float = 25.0,
         height_channel: str = "r",
+        clearance_cost_weight: float = 0.0,
+        clearance_cost_radius: float = 0.0,
     ):
         self.map_path = map_path
         self.obstacle_height_threshold = float(obstacle_height_threshold)
         self.height_channel = height_channel
+        self.clearance_cost_weight = max(0.0, float(clearance_cost_weight))
+        self.clearance_cost_radius = max(0.0, float(clearance_cost_radius))
 
         try:
             import cv2
@@ -50,6 +54,11 @@ class AStarPlanner:
         self.raw_img = raw_img
         self.height_map = self._extract_height_map(raw_img)
         self.grid = self.height_map >= self.obstacle_height_threshold
+        self.clearance_map = self._compute_clearance_map()
+
+    def _compute_clearance_map(self):
+        free_mask = (~self.grid).astype(np.uint8)
+        return self._cv2.distanceTransform(free_mask, self._cv2.DIST_L2, 5)
 
     def _extract_height_map(self, image):
         if image.ndim == 2:
@@ -105,6 +114,23 @@ class AStarPlanner:
             )
         if self.is_obstacle(pixel):
             raise ValueError("{} pixel {} is inside an obstacle".format(label, pixel))
+
+    def clearance_at(self, pixel: Pixel) -> float:
+        if not self.in_bounds(pixel):
+            return 0.0
+        u, v = pixel
+        return float(self.clearance_map[v, u])
+
+    def clearance_cost(self, pixel: Pixel) -> float:
+        if self.clearance_cost_weight <= 0.0 or self.clearance_cost_radius <= 0.0:
+            return 0.0
+
+        clearance = self.clearance_at(pixel)
+        if clearance >= self.clearance_cost_radius:
+            return 0.0
+
+        deficit = (self.clearance_cost_radius - clearance) / self.clearance_cost_radius
+        return self.clearance_cost_weight * deficit * deficit
 
     @staticmethod
     def heuristic(a: Pixel, b: Pixel):
@@ -169,7 +195,10 @@ class AStarPlanner:
                 ):
                     continue
 
-                tentative_g = gscore[current] + self.heuristic(current, neighbor)
+                step_cost = self.heuristic(current, neighbor) + self.clearance_cost(
+                    neighbor
+                )
+                tentative_g = gscore[current] + step_cost
                 if neighbor in closed and tentative_g >= gscore.get(neighbor, math.inf):
                     continue
 
@@ -200,11 +229,15 @@ class AStarPlanner3D(AStarPlanner):
         obstacle_height_threshold: float = 25.0,
         height_channel: str = "r",
         height_weight: float = 8.0,
+        clearance_cost_weight: float = 0.0,
+        clearance_cost_radius: float = 0.0,
     ):
         super().__init__(
             map_path=map_path,
             obstacle_height_threshold=obstacle_height_threshold,
             height_channel=height_channel,
+            clearance_cost_weight=clearance_cost_weight,
+            clearance_cost_radius=clearance_cost_radius,
         )
         self.height_weight = max(0.0, float(height_weight))
 
@@ -217,7 +250,11 @@ class AStarPlanner3D(AStarPlanner):
     def _transition_cost(self, current: Pixel, neighbor: Pixel) -> float:
         planar_cost = self.heuristic(current, neighbor)
         height_delta = abs(self.get_height(neighbor) - self.get_height(current))
-        return planar_cost + self.height_weight * height_delta
+        return (
+            planar_cost
+            + self.clearance_cost(neighbor)
+            + self.height_weight * height_delta
+        )
 
     def astar_3d(
         self,

@@ -40,6 +40,8 @@ class PlannerConfig:
     pixel_to_airsim_matrix: str
     obstacle_height_threshold: float = 25.0
     height_channel: str = "r"
+    clearance_cost_weight: float = 0.0
+    clearance_cost_radius: float = 0.0
     waypoint_stride: int = 15
     planning_mode: str = "3d"
     height_weight: float = 8.0
@@ -804,6 +806,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=float, default=None)
     parser.add_argument("--obstacle-height-threshold", type=float, default=None)
     parser.add_argument("--height-channel", type=str, default=None)
+    parser.add_argument("--clearance-cost-weight", type=float, default=None)
+    parser.add_argument("--clearance-cost-radius", type=float, default=None)
     parser.add_argument("--planning-mode", type=str, choices=("2d", "3d"), default=None)
     parser.add_argument("--height-weight", type=float, default=None)
     parser.add_argument("--height-lift-coef", type=float, default=None)
@@ -1295,6 +1299,22 @@ def load_config(args: argparse.Namespace) -> EvaluationConfig:
         if max_segment_altitude_delta <= 0.0:
             raise ValueError("planner.max_segment_altitude_delta must be > 0 or null")
 
+    clearance_cost_weight = float(
+        args.clearance_cost_weight
+        if args.clearance_cost_weight is not None
+        else planner_payload.get("clearance_cost_weight", 0.0)
+    )
+    if clearance_cost_weight < 0.0:
+        raise ValueError("planner.clearance_cost_weight must be >= 0")
+
+    clearance_cost_radius = float(
+        args.clearance_cost_radius
+        if args.clearance_cost_radius is not None
+        else planner_payload.get("clearance_cost_radius", 0.0)
+    )
+    if clearance_cost_radius < 0.0:
+        raise ValueError("planner.clearance_cost_radius must be >= 0")
+
     planner = PlannerConfig(
         map_path=resolve_path(config_dir, map_path),
         pixel_to_airsim_matrix=resolve_path(config_dir, matrix_path),
@@ -1308,6 +1328,8 @@ def load_config(args: argparse.Namespace) -> EvaluationConfig:
             if args.height_channel is not None
             else planner_payload.get("height_channel", "r")
         ),
+        clearance_cost_weight=clearance_cost_weight,
+        clearance_cost_radius=clearance_cost_radius,
         waypoint_stride=int(planner_payload.get("waypoint_stride", 6)),
         planning_mode=planning_mode,
         height_weight=float(
@@ -1971,12 +1993,16 @@ def main() -> None:
             obstacle_height_threshold=planner_cfg.obstacle_height_threshold,
             height_channel=planner_cfg.height_channel,
             height_weight=planner_cfg.height_weight,
+            clearance_cost_weight=planner_cfg.clearance_cost_weight,
+            clearance_cost_radius=planner_cfg.clearance_cost_radius,
         )
     else:
         a_star = AStarPlanner(
             planner_cfg.map_path,
             obstacle_height_threshold=planner_cfg.obstacle_height_threshold,
             height_channel=planner_cfg.height_channel,
+            clearance_cost_weight=planner_cfg.clearance_cost_weight,
+            clearance_cost_radius=planner_cfg.clearance_cost_radius,
         )
 
     visualizer: Optional[MapVisualizer] = None
