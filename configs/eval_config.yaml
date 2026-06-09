@@ -5,7 +5,7 @@ planner:
   height_channel: r
   clearance_cost_weight: 20.0
   clearance_cost_radius: 6.0
-  waypoint_stride: 10
+  waypoint_stride: 15
   planning_mode: 3d
   height_weight: 8.0
   height_lift_coef: 0.3
@@ -16,7 +16,7 @@ paths:
   height: -50.0
 
 env:
-  max_episode_steps: 800
+  max_episode_steps: 2000
   success_threshold: 0.0
 
 eval:
